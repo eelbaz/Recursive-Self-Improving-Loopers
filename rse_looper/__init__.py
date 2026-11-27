@@ -1,30 +1,43 @@
-"""rse_looper: Local Recursive Self-Improvement recipe for looped Mixture-of-Experts models."""
+"""Local loop-dynamics editing, self-training, and experiment evidence tools.
 
-from rse_looper.checkpoint import export_edited_checkpoint, is_editable_param, normalize_param_name
-from rse_looper.fpsolve import solve_nullspace_ridge
-from rse_looper.grader import detect_repetition, extract_boxed, grade_math_output, split_inkling_output
-from rse_looper.gspo import accept_3regime_rsi_step, clip_generation_deltas, compute_loop_advantage_gspo_groups, gspo_dapo_sequence_loss
-from rse_looper.looping import LoopConfig, install_midstack_loop_forward
-from rse_looper.pipeline import PipelineConfig, merge_generation_deltas
-from rse_looper.preflight import enable_fast_math, preflight_gpu_check
+Public helpers are imported on first access. Inspecting evidence or grading
+answers must not initialize a training runtime or pre-import CLI modules.
+"""
 
-__all__ = [
-    "LoopConfig",
-    "PipelineConfig",
-    "accept_3regime_rsi_step",
-    "clip_generation_deltas",
-    "compute_loop_advantage_gspo_groups",
-    "detect_repetition",
-    "enable_fast_math",
-    "export_edited_checkpoint",
-    "extract_boxed",
-    "grade_math_output",
-    "gspo_dapo_sequence_loss",
-    "install_midstack_loop_forward",
-    "is_editable_param",
-    "merge_generation_deltas",
-    "normalize_param_name",
-    "preflight_gpu_check",
-    "solve_nullspace_ridge",
-    "split_inkling_output",
-]
+from importlib import import_module
+
+_EXPORT_MODULES = {
+    "LoopConfig": "looping",
+    "PipelineConfig": "pipeline",
+    "accept_3regime_rsi_step": "gspo",
+    "clip_generation_deltas": "gspo",
+    "compute_loop_advantage_gspo_groups": "gspo",
+    "detect_repetition": "grader",
+    "enable_fast_math": "preflight",
+    "export_edited_checkpoint": "checkpoint",
+    "extract_boxed": "grader",
+    "grade_math_output": "grader",
+    "gspo_dapo_sequence_loss": "gspo",
+    "install_midstack_loop_forward": "looping",
+    "is_editable_param": "checkpoint",
+    "merge_generation_deltas": "pipeline",
+    "normalize_param_name": "checkpoint",
+    "preflight_gpu_check": "preflight",
+    "solve_nullspace_ridge": "fpsolve",
+    "split_inkling_output": "grader",
+}
+
+__all__ = list(_EXPORT_MODULES)
+
+
+def __getattr__(name: str):
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{module_name}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

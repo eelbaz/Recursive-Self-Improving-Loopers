@@ -32,7 +32,18 @@
 </head>
 <body>
 <main>
-  <h1>Recursive Self-Improving Loopers: Local Loop-Dynamics Editing and Self-Improvement (<code>Inkblot-2-mini</code>)</h1>
+  <aside class="box" style="border:2px solid #b45309;background:#fffbeb;color:#451a03;padding:1rem" role="note">
+    <strong>Historical, unreproduced experiment report.</strong>
+    This page and its figures describe the original release, not measurements
+    from the corrected implementation. The recorded training history includes
+    accepted updates that violate the released gate. The original per-item
+    traces, exact data slices and merge provenance are missing. Software tests
+    and source corrections do not validate the benchmark claims below.
+    See the <a href="../README.md">current README</a>,
+    <a href="REPRODUCIBILITY.md">reproducibility protocol</a> and
+    <a href="../results/README.md">historical-result notice</a>.
+  </aside>
+  <h1>Historical report — Recursive Self-Improving Loopers: Local Loop-Dynamics Editing and Self-Improvement (<code>Inkblot-2-mini</code>)</h1>
   <div class="meta">Eric E., Tensorbend.ai Research &middot; November 26, 2026 &middot; <a href="https://github.com/eelbaz/Recursive-Self-Improving-Loopers/blob/main/paper/main.pdf">PDF Paper</a> &middot; <a href="https://github.com/eelbaz/Recursive-Self-Improving-Loopers">GitHub</a> &middot; <a href="https://huggingface.co/Ex0bit/Inkblot-2-mini">Hugging Face (Inkblot-2-mini)</a></div>
 
   <div class="box tldr">
@@ -90,10 +101,15 @@
   </table>
   <p style="font-size:0.88rem;color:#475569;"><em>*Base 4-pass and 5-pass scores are measured under our forced multi-pass override (<code>LoopConfig(num_passes=4/5)</code>). Evaluations use fixed public slices (n=32&ndash;300), greedy decoding, and open deterministic grading (<code>rse_looper/grader.py</code>). Independent third-party reproduction is welcomed.</em></p>
 
-  <h2>5. Run Locally</h2>
-  <pre>pip install -e ".[dev]"
-pytest -W error -v
-rse-looper --stage both --base-model thinkingmachines/Inkling-2-Mini --gpus 0,1,2,3,4,5 --require-causal-conv1d</pre>
+  <h2>5. Current installation and reproduction instructions</h2>
+  <p>The original release commands omitted required data and model-runtime
+  dependencies. Follow the current
+  <a href="https://github.com/eelbaz/Recursive-Self-Improving-Loopers#install-and-test">installation instructions</a>
+  and <a href="https://github.com/eelbaz/Recursive-Self-Improving-Loopers#run-a-new-experiment">experiment commands</a>.
+  A new training run needs explicit, disjoint training and selection data;
+  independent evaluation also needs a frozen final test. See the
+  <a href="https://github.com/eelbaz/Recursive-Self-Improving-Loopers/blob/main/docs/REPRODUCIBILITY.md">reproducibility protocol</a>
+  for the evidence required to substantiate a new result.</p>
 </main>
 </body>
 </html>

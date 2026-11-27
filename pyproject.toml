@@ -5,21 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rse-looper"
 version = "1.0.0"
-description = "Local Recursive Self-Improvement recipe for looped Mixture-of-Experts language models (Inkblot-2-mini)."
+description = "Local loop-dynamics editing, verifier-guided self-training, and reproducible experiment evidence."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.4",
+    "torch>=2.6",
     "safetensors>=0.4",
     "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0,<10"]
+runtime = [
+    "transformers @ git+https://github.com/huggingface/transformers.git@b62646bbda836d467060b7e3d64028202079b77d",
+    "accelerate>=1.16,<2",
+    "huggingface-hub>=1,<3",
+]
 figures = ["matplotlib>=3.9", "numpy>=1.26"]
 
 [project.scripts]
-rse-looper = "rse_looper.pipeline:main"
+rse-looper = "rse_looper.pipeline:cli"
+rse-looper-evidence = "rse_looper.evidence:cli"
 
 [tool.setuptools.packages.find]
 include = ["rse_looper*"]

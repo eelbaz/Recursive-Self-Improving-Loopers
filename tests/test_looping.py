@@ -71,3 +71,43 @@ def test_damped_rk_bit_exact_when_k1_and_cache_isolated_for_k3():
     assert torch.equal(cache.layers[0].keys, torch.ones(1, 2, 4))
     assert torch.equal(cache.conv_states[0]["attn"], torch.full((1, 4, 3), 2.0))
     assert out_k3.shape == h.shape and torch.isfinite(out_k3).all()
+
+
+def test_given_lazy_cache_when_substeps_run_then_initialization_and_counters_commit_once():
+    """Given an uninitialized slot, When probing twice, Then only the final call advances state."""
+    cache = _DummyCache()
+    slot = cache.layers[0]
+    slot.keys = slot.values = None
+    slot.is_initialized = False
+    slot.cumulative_length = 0
+    slot.conv_states = [None, None]
+
+    def layer(x):
+        state = cache.layers[0]
+        state.keys = x.clone() if state.keys is None else torch.cat([state.keys, x], dim=1)
+        state.values = state.keys.clone()
+        state.is_initialized = True
+        state.cumulative_length += x.shape[1]
+        state.conv_states[0] = torch.tensor(float(state.cumulative_length))
+        return x + 1
+
+    result = run_damped_rk_layer(layer, torch.zeros(1, 2, 4), rk_K=3, cache=cache)
+    assert result.shape == (1, 2, 4)
+    assert cache.layers[0].keys.shape[1] == 2
+    assert cache.layers[0].cumulative_length == 2
+    assert cache.layers[0].conv_states[0].item() == 2
+
+
+def test_given_probe_failure_when_damping_then_original_cache_is_restored():
+    """Given live cache state, When a probe raises, Then it leaves no partially updated state."""
+    cache = _DummyCache()
+
+    def broken_layer(x):
+        cache.layers[0].keys.fill_(42)
+        cache.conv_states[0]["attn"].fill_(42)
+        raise RuntimeError("probe failed")
+
+    with pytest.raises(RuntimeError, match="probe failed"):
+        run_damped_rk_layer(broken_layer, torch.zeros(1, 2, 4), rk_K=2, cache=cache)
+    assert torch.count_nonzero(cache.layers[0].keys) == 0
+    assert torch.equal(cache.conv_states[0]["attn"], torch.ones(1, 4, 3))
