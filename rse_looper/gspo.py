@@ -1,11 +1,11 @@
 """Autonomous Multi-Generation Loop-Advantage GSPO + DAPO (rse_looper.gspo).
 
 Implements:
-  - GSPO sequence-level geometric-mean importance ratios (eliminating MoE token routing variance).
+  - GSPO-style sequence-level geometric-mean importance ratios.
   - DAPO asymmetric Clip-Higher (eps_low=0.20, eps_high=0.28) + dynamic frontier filtering.
   - Dr. GRPO unbiased group advantages (A_i = r_i - mean(r_G)).
   - Loop-Advantage bonus (+delta_r_bonus) when 4-pass or 2-step damped solves a problem 3-pass missed.
-  - Strict 3-mode hidden gate and full multi-GPU DDP runner (zero external teacher, 0 expert edits).
+  - A fixed 3-mode selection gate, explicit labeled inputs, and durable run provenance.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import math
 import os
 import random
-import time
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import torch
 import torch.nn.functional as F
@@ -81,6 +80,7 @@ def compute_loop_advantage_gspo_groups(
                 "correct": bool(r.get("correct")),
                 "completed": bool(r.get("completed")),
                 "gen_tokens": int(r.get("gen_tokens", 0)),
+                **{key: r[key] for key in ("prompt_token_ids", "completion_token_ids") if key in r},
             })
         active_groups.append({"id": pid, "items": items})
 
@@ -117,25 +117,54 @@ def gspo_dapo_sequence_loss(
     return loss, info
 
 
-def accept_3regime_rsi_step(
+def rsi_step_decision(
     cur_gate: Mapping[str, Any],
     cand_gate: Mapping[str, Any],
     max_single_regime_drop: int = 2,
+) -> Dict[str, Any]:
+    """Return the shared acceptance rule's decision and stable event-log reason."""
+    from rse_looper.run_state import assess_gate_candidate
+    return assess_gate_candidate(cur_gate, cand_gate, max_single_regime_drop)
+
+
+def accept_3regime_rsi_step(
+    cur_gate: Mapping[str, Any], cand_gate: Mapping[str, Any], max_single_regime_drop: int = 2,
 ) -> bool:
-    """Strict 3-mode (3-pass, 4-pass, 2-step damped) compounding acceptance rule."""
-    regimes = ("R3", "R4", "RK2")
-    if cand_gate["max_rep"] > max(3.12, cur_gate["max_rep"] + 1.6):
-        return False
-    if any(cand_gate[r]["correct"] < cur_gate[r]["correct"] - max_single_regime_drop for r in regimes):
-        return False
-    if cand_gate["total_correct"] > cur_gate["total_correct"]:
-        return True
-    if (
-        cand_gate["total_correct"] == cur_gate["total_correct"]
-        and cand_gate["total_completed"] >= cur_gate["total_completed"] + 4
-    ):
-        return True
-    return False
+    """Compatibility wrapper around the logged acceptance decision."""
+    return rsi_step_decision(cur_gate, cand_gate, max_single_regime_drop)["accepted"]
+
+
+def partition_gate_rows(rows: Sequence[dict], local_idx: int, worker_count: int) -> List[dict]:
+    """Every GPU evaluates its shard in all three regimes, including a single GPU."""
+    if worker_count < 1 or not 0 <= local_idx < worker_count:
+        raise ValueError("Invalid gate worker index or count.")
+    return list(rows[local_idx::worker_count])
+
+
+def rollout_sequence(row: Mapping[str, Any]) -> Tuple[torch.Tensor, int]:
+    """Use exact sampled token IDs; never re-tokenize or silently truncate a solution."""
+    prompt = row.get("prompt_token_ids")
+    completion = row.get("completion_token_ids")
+    if not isinstance(prompt, list) or not prompt or not isinstance(completion, list) or not completion:
+        raise ValueError("Rollout requires nonempty prompt_token_ids and completion_token_ids.")
+    if any(not isinstance(token, int) or isinstance(token, bool) or token < 0 for token in prompt + completion):
+        raise ValueError("Rollout token IDs must be nonnegative integers.")
+    return torch.tensor([prompt + completion], dtype=torch.long), len(prompt)
+
+
+class EmptyFrontierError(ValueError):
+    """A valid rollout batch with no mixed reward groups, rather than a run failure."""
+
+    def __init__(self, stats: dict):
+        super().__init__("No active frontier: all sampled problem groups were uniformly correct or incorrect; no update was run.")
+        self.stats = stats
+
+
+def prepare_gspo_training_rows(rollouts_by_id: Mapping[str, Sequence[Mapping[str, Any]]]) -> Tuple[List[dict], dict]:
+    groups, stats = compute_loop_advantage_gspo_groups(rollouts_by_id)
+    if not groups:
+        raise EmptyFrontierError(stats)
+    return [item for group in groups for item in group["items"]], stats
 
 
 def clip_generation_deltas(
@@ -159,9 +188,13 @@ def clip_generation_deltas(
 
 def avg_sequence_logprob(logits: torch.Tensor, input_ids: torch.Tensor, prompt_len: int) -> torch.Tensor:
     """Mean per-token log-probability over completion tokens."""
+    if input_ids.ndim != 2 or logits.ndim != 3 or logits.shape[:2] != input_ids.shape:
+        raise ValueError("Logits and token sequence shapes must agree.")
+    if not isinstance(prompt_len, int) or not 1 <= prompt_len < input_ids.shape[1]:
+        raise ValueError("prompt_len must leave at least one completion token.")
     shift_logits = logits[:, :-1, :].float()
     shift_labels = input_ids[:, 1:]
-    st = max(0, min(prompt_len - 1, shift_labels.shape[1] - 1))
+    st = prompt_len - 1
     logp = F.log_softmax(shift_logits[:, st:, :], dim=-1)
     tok_lp = logp.gather(-1, shift_labels[:, st:].unsqueeze(-1)).squeeze(-1)
     return tok_lp.mean()
@@ -173,6 +206,27 @@ def _format_math_prompt(tok: Any, problem: str, effort: str = "high") -> str:
         return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, reasoning_effort=effort)
     except TypeError:
         return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+
+def configure_generation(model: Any, *, max_new_tokens: int, pad_token_id: int,
+                         eos_token_id: int, do_sample: bool = True):
+    """Use an explicit unfiltered policy matching the raw likelihood calculation.
+
+Reset inherited generation controls: a model's repetition penalties, forced
+tokens or truncation filters would otherwise change the behavior distribution.
+"""
+    from transformers import GenerationConfig
+
+    model.generation_config = GenerationConfig()
+    return GenerationConfig(
+        do_sample=do_sample, num_beams=1, num_return_sequences=1,
+        temperature=1.0, top_p=1.0, top_k=0, typical_p=1.0,
+        repetition_penalty=1.0, encoder_repetition_penalty=1.0,
+        no_repeat_ngram_size=0, encoder_no_repeat_ngram_size=0,
+        min_length=0, min_new_tokens=0, use_cache=True,
+        max_new_tokens=max_new_tokens, pad_token_id=pad_token_id, eos_token_id=eos_token_id,
+        return_dict_in_generate=False, output_scores=False,
+    )
 
 
 def _search_worker(local_idx: int, gpu_ids: List[int], model_path: str, rows: List[dict], out_dir: str, gen_idx: int, max_new_tokens: int) -> None:
@@ -194,6 +248,8 @@ def _search_worker(local_idx: int, gpu_ids: List[int], model_path: str, rows: Li
     model = Inkling2LoopForCausalLM.from_pretrained(
         model_path, dtype=torch.bfloat16, device_map={"": device}, experts_implementation="grouped_mm"
     ).eval()
+    generation_config = configure_generation(model, max_new_tokens=max_new_tokens,
+                                             pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
 
     my_rows = [r for i, r in enumerate(rows) if i % len(gpu_ids) == local_idx]
     reg_specs = [
@@ -213,8 +269,7 @@ def _search_worker(local_idx: int, gpu_ids: List[int], model_path: str, rows: Li
             torch.manual_seed(20000 * gen_idx + 100 * local_idx + start)
             with torch.no_grad():
                 gen_out = model.generate(
-                    **inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.72, top_p=0.95,
-                    pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id,
+                    **inputs, generation_config=generation_config,
                 )
             for j, (r, s_idx) in enumerate(chunk):
                 g_ids = gen_out[j, in_len:]
@@ -223,17 +278,19 @@ def _search_worker(local_idx: int, gpu_ids: List[int], model_path: str, rows: Li
                     g_ids = g_ids[: ep[0].item() + 1]
                 raw = tok.decode(g_ids, skip_special_tokens=False)
                 g = grade_math_output(raw, r["answer"])
-                pr = _format_math_prompt(tok, r["problem"])
-                p_len = len(tok(pr)["input_ids"])
-                full_ids = tok(pr + raw, return_tensors="pt", truncation=True, max_length=1280)["input_ids"].to(device)
+                prompt_ids = inputs["input_ids"][j][inputs["attention_mask"][j].bool()].tolist()
+                completion_ids = g_ids.tolist()
+                full_ids, p_len = rollout_sequence({"prompt_token_ids": prompt_ids, "completion_token_ids": completion_ids})
+                full_ids = full_ids.to(device)
                 with torch.no_grad():
                     logits = model(input_ids=full_ids, use_cache=False).logits
-                    old_lp = float(avg_sequence_logprob(logits, full_ids, min(p_len, full_ids.shape[1] - 4)).item())
+                    old_lp = float(avg_sequence_logprob(logits, full_ids, p_len).item())
                 records.append({
                     "id": r["id"], "problem": r["problem"], "answer": r["answer"], "regime": reg_name,
                     "sample_idx": s_idx, "gen_tokens": int(len(g_ids)), "correct": bool(g["correct"]),
                     "completed": bool(g["completed"]), "repetition": bool(g["repetition"]),
                     "old_avg_logprob": old_lp, "raw_full": raw,
+                    "prompt_token_ids": prompt_ids, "completion_token_ids": completion_ids,
                 })
     with open(os.path.join(out_dir, f"search.shard{local_idx}.jsonl"), "w") as f:
         for rec in records:
@@ -259,7 +316,6 @@ def _ddp_update_worker(
     enable_fast_math()
     device = f"cuda:{gid}"
 
-    tok = AutoTokenizer.from_pretrained(model_path)
     model = Inkling2LoopForCausalLM.from_pretrained(
         model_path, dtype=torch.bfloat16, device_map={"": device}, experts_implementation="grouped_mm"
     )
@@ -272,13 +328,14 @@ def _ddp_update_worker(
             trainable.append((name, p))
             orig_w[name] = p.detach().float().cpu().clone()
 
-    rows = [json.loads(l) for l in open(gspo_path) if l.strip()]
+    with open(gspo_path) as stream:
+        rows = [json.loads(line) for line in stream if line.strip()]
+    if not rows:
+        raise ValueError("Empty frontier training data; update was not started.")
     prepped = []
     for r in rows:
-        pr = _format_math_prompt(tok, r["problem"])
-        p_len = len(tok(pr)["input_ids"])
-        ids = tok(pr + r["raw_full"], return_tensors="pt", truncation=True, max_length=1280)["input_ids"]
-        prepped.append((ids, min(p_len, ids.shape[1] - 4), r["regime"], float(r["advantage"]), float(r["old_avg_logprob"])))
+        ids, p_len = rollout_sequence(r)
+        prepped.append((ids, p_len, r["regime"], float(r["advantage"]), float(r["old_avg_logprob"])))
 
     my_idxs = [i for i in range(len(prepped)) if i % world_size == local_rank] or [0]
     opt = torch.optim.AdamW([p for _, p in trainable], lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
@@ -290,7 +347,9 @@ def _ddp_update_worker(
         "RK2": LoopConfig(num_passes=3, rk_window=(10, 13), rk_K=2, rk_beta=0.3),
     }
 
-    model.train()
+    # Keep deterministic evaluation behavior while autograd is enabled. Changing
+    # dropout between the old and current policy would confound the likelihood ratio.
+    model.eval()
     for step in range(1, steps + 1):
         prog = max(0.0, (step - 3) / max(1, steps - 3))
         cur_lr = lr * (step / 3.0) if step <= 3 else lr * (0.20 + 0.80 * 0.5 * (1.0 + math.cos(math.pi * prog)))
@@ -323,7 +382,7 @@ def _ddp_update_worker(
     dist.destroy_process_group()
 
 
-def _gate_worker(local_idx: int, gpu_ids: List[int], model_path: str, delta_path: str | None, scale: float, gate_rows: List[dict], out_dir: str, tag: str) -> None:
+def _gate_worker(local_idx: int, gpu_ids: List[int], model_path: str, delta_path: str | None, scale: float, gate_rows: List[dict], out_dir: str, tag: str, max_new_tokens: int = 1536) -> None:
     import json
     from transformers import AutoTokenizer, Inkling2LoopForCausalLM
     from rse_looper.checkpoint import apply_weight_deltas
@@ -332,9 +391,9 @@ def _gate_worker(local_idx: int, gpu_ids: List[int], model_path: str, delta_path
     from rse_looper.preflight import enable_fast_math
 
     regimes = [("R3", LoopConfig(num_passes=3, rk_K=1)), ("R4", LoopConfig(num_passes=4, rk_K=1)), ("RK2", LoopConfig(num_passes=3, rk_window=(10, 13), rk_K=2, rk_beta=0.3))]
-    reg_name, cfg = regimes[local_idx % 3]
-    sh_id = local_idx // 3
-    n_sh = max(1, len(gpu_ids) // 3)
+    my_rows = partition_gate_rows(gate_rows, local_idx, len(gpu_ids))
+    if not my_rows:
+        raise ValueError("Gate worker received an empty shard.")
     gid = gpu_ids[local_idx]
     torch.cuda.set_device(gid)
     enable_fast_math()
@@ -353,32 +412,76 @@ def _gate_worker(local_idx: int, gpu_ids: List[int], model_path: str, delta_path
             d = {k: v * float(scale) for k, v in d.items()}
         apply_weight_deltas(model, d)
 
-    install_midstack_loop_forward(model, cfg)
-    my_rows = [r for i, r in enumerate(gate_rows) if i % n_sh == sh_id]
-    texts = [_format_math_prompt(tok, r["problem"]) for r in my_rows]
-    inputs = tok(texts, return_tensors="pt", padding=True).to(device)
-    in_len = inputs["input_ids"].shape[1]
-    with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=1536, do_sample=False, pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
-    res = []
-    for j, r in enumerate(my_rows):
-        g_ids = out[j, in_len:]
-        ep = (g_ids == tok.eos_token_id).nonzero(as_tuple=True)[0]
-        if len(ep) > 0:
-            g_ids = g_ids[: ep[0].item() + 1]
-        g = grade_math_output(tok.decode(g_ids, skip_special_tokens=False), r["answer"])
-        res.append({"id": r["id"], "gen_tokens": int(len(g_ids)), **g})
-    with open(os.path.join(out_dir, f"{tag}_{reg_name}.sh{sh_id}.jsonl"), "w") as f:
-        for item in res:
-            f.write(json.dumps(item) + "\n")
+    generation_config = configure_generation(model, max_new_tokens=max_new_tokens,
+                                             pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id,
+                                             do_sample=False)
+
+    for reg_name, cfg in regimes:
+        install_midstack_loop_forward(model, cfg)
+        texts = [_format_math_prompt(tok, r["problem"]) for r in my_rows]
+        inputs = tok(texts, return_tensors="pt", padding=True).to(device)
+        in_len = inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            out = model.generate(**inputs, generation_config=generation_config)
+        res = []
+        for j, r in enumerate(my_rows):
+            g_ids = out[j, in_len:]
+            ep = (g_ids == tok.eos_token_id).nonzero(as_tuple=True)[0]
+            if len(ep) > 0:
+                g_ids = g_ids[: ep[0].item() + 1]
+            raw = tok.decode(g_ids, skip_special_tokens=False)
+            g = grade_math_output(raw, r["answer"])
+            res.append({"id": r["id"], "gen_tokens": int(len(g_ids)), "raw_full": raw, **g})
+        with open(os.path.join(out_dir, f"{tag}_{reg_name}.sh{local_idx}.jsonl"), "w") as f:
+            for item in res:
+                f.write(json.dumps(item) + "\n")
+
+
+def evaluate_gate(gpu_ids: List[int], model_path: str, delta_path: str | None, scale: float,
+                  gate_rows: List[dict], out_dir: str, tag: str, max_new_tokens: int = 1536) -> dict:
+    """Run all three regimes for every row, independently of the number of GPUs."""
+    import json
+    import torch.multiprocessing as mp
+    from rse_looper.grader import validate_binary_rows
+
+    if not gpu_ids or not gate_rows:
+        raise ValueError("Gate evaluation requires GPUs and nonempty selection data.")
+    os.makedirs(out_dir, exist_ok=True)
+    n_workers = min(len(gpu_ids), len(gate_rows))
+    mp.spawn(_gate_worker, args=(gpu_ids[:n_workers], model_path, delta_path, scale, gate_rows,
+                                out_dir, tag, max_new_tokens), nprocs=n_workers, join=True)
+    out: dict = {}
+    tot_ok, tot_comp, max_rep = 0, 0, 0.0
+    expected_ids = sorted(row["id"] for row in gate_rows)
+    for reg in ("R3", "R4", "RK2"):
+        rows = []
+        for shard in range(n_workers):
+            with open(os.path.join(out_dir, f"{tag}_{reg}.sh{shard}.jsonl")) as stream:
+                rows.extend(json.loads(line) for line in stream if line.strip())
+        validated = validate_binary_rows(rows, name=f"selection/{reg}")
+        if sorted(validated) != expected_ids:
+            raise ValueError(f"Gate output coverage mismatch for {reg}; missing or duplicate problem IDs.")
+        n = len(rows)
+        if any("completed" not in row or "repetition" not in row for row in rows):
+            raise ValueError("Gate rows require completed and repetition JSON booleans.")
+        ok = sum(row["correct"] for row in rows)
+        comp = sum(row["completed"] for row in rows)
+        rep = round(sum(row["repetition"] for row in rows) / n * 100.0, 2)
+        out[reg] = {"n": n, "correct": ok, "completed": comp, "acc": round(ok / n * 100.0, 2), "rep": rep}
+        tot_ok += ok
+        tot_comp += comp
+        max_rep = max(max_rep, rep)
+    out.update(total_correct=tot_ok, total_completed=tot_comp,
+               mean_acc=round(tot_ok / (3 * len(gate_rows)) * 100.0, 2), max_rep=max_rep)
+    return out
 
 
 def build_parser():
     import argparse
     ap = argparse.ArgumentParser(prog="python -m rse_looper.gspo", description="Run autonomous multi-generation Loop-Advantage GSPO + DAPO.")
     ap.add_argument("--init-model", default="./models/Inkling-2-Mini-FPSolve")
-    ap.add_argument("--train-jsonl", default="./data/train_math.jsonl")
-    ap.add_argument("--gate-jsonl", default="./data/gate_math.jsonl")
+    ap.add_argument("--train-jsonl", help="Required labeled training JSONL (id, problem, answer).")
+    ap.add_argument("--gate-jsonl", help="Required disjoint selection JSONL; this is not a final test set.")
     ap.add_argument("--work-dir", default="./runs/gspo")
     ap.add_argument("--ckpt-prefix", default="./models/Inkblot-2-mini")
     ap.add_argument("--gpus", default="0,1,2,3,4,5")
@@ -388,6 +491,9 @@ def build_parser():
     ap.add_argument("--gate-size", type=int, default=64)
     ap.add_argument("--steps-per-gen", type=int, default=24)
     ap.add_argument("--lr", type=float, default=2.0e-5)
+    ap.add_argument("--max-new-tokens", type=int, default=1536)
+    ap.add_argument("--gate-max-new-tokens", type=int, default=1536)
+    ap.add_argument("--model-revision", help="Pin a Hub model revision; local checkpoints are hashed directly.")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     return ap
@@ -395,97 +501,133 @@ def build_parser():
 
 def main(argv=None) -> dict:
     import json
+    from pathlib import Path
+    import tempfile
     import torch.multiprocessing as mp
-    from rse_looper.checkpoint import export_edited_checkpoint
     from rse_looper.preflight import enable_fast_math, preflight_gpu_check
+    from rse_looper.run_state import RunLedger, checkpoint_fingerprint, load_math_inputs
 
     args = build_parser().parse_args(argv)
+    gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]
+    if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids) or any(gpu < 0 for gpu in gpu_ids):
+        raise ValueError("GPU IDs must be a nonempty list of distinct nonnegative integers.")
+    for name in ("max_gens", "patience", "problems_per_gen", "gate_size", "steps_per_gen", "max_new_tokens", "gate_max_new_tokens"):
+        if getattr(args, name) < 1:
+            raise ValueError(f"{name} must be positive.")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        raise ValueError("Learning rate must be finite and positive.")
+
+    # Validate input identity and split separation before GPU setup or model downloads.
+    inputs = None
+    if args.train_jsonl or args.gate_jsonl or not args.dry_run:
+        inputs = load_math_inputs(args.train_jsonl, args.gate_jsonl, gate_size=args.gate_size)
     enable_fast_math()
-    gpu_ids = [int(x.strip()) for x in args.gpus.split(",") if x.strip()]
     preflight = preflight_gpu_check(require_causal_conv1d=False)
     summary = {
         "init_model": args.init_model, "work_dir": args.work_dir,
         "ckpt_prefix": args.ckpt_prefix, "gpus": gpu_ids, "max_gens": args.max_gens,
-        "preflight": preflight,
+        "preflight": preflight, "inputs_validated": inputs is not None,
+        "selection_is_test": False, "output_policy": "last_accepted_checkpoint",
     }
     if args.dry_run:
+        summary["dry_run"] = True
+        summary["model_resolved"] = False
+        if inputs is None:
+            summary["required_inputs"] = ["--train-jsonl", "--gate-jsonl"]
         return summary
     if not preflight["cuda_available"]:
-        raise RuntimeError("Loop-Advantage GSPO requires CUDA GPUs.")
+        raise RuntimeError("Loop-Advantage GSPO requires CUDA GPUs; validated inputs were not trained.")
 
-    os.makedirs(args.work_dir, exist_ok=True)
-    train_pool = [json.loads(l) for l in open(args.train_jsonl) if l.strip()]
-    gate_rows = [json.loads(l) for l in open(args.gate_jsonl) if l.strip()][: args.gate_size]
+    from rse_looper.checkpoint import export_edited_checkpoint, resolve_checkpoint_dir
+    initial_path = resolve_checkpoint_dir(args.init_model, revision=args.model_revision)
+    initial = checkpoint_fingerprint(initial_path)
+    run_config = {key: value for key, value in vars(args).items() if key not in {"resume", "dry_run", "work_dir"}}
+    run_config.update(acceptance_rule="three_regime_v1", candidate_rank=["total_correct", "total_completed"],
+                      output_policy="last_accepted_checkpoint", likelihood_policy="complete_sampled_token_ids",
+                      sampling_policy={"temperature": 1.0, "top_p": 1.0, "top_k": 0,
+                                       "inherited_generation_controls": "reset", "repetition_penalty": 1.0})
 
-    def run_gate(model_p: str, delta_p: str | None, scale: float, gdir: str, tag: str) -> dict:
-        os.makedirs(gdir, exist_ok=True)
-        n_workers = min(len(gpu_ids), 6 if len(gpu_ids) >= 6 else 3)
-        mp.spawn(_gate_worker, args=(gpu_ids[:n_workers], model_p, delta_p, scale, gate_rows, gdir, tag), nprocs=n_workers, join=True)
-        out: dict = {}
-        tot_ok, tot_comp, max_rep = 0, 0, 0.0
-        n_sh = max(1, n_workers // 3)
-        for reg in ("R3", "R4", "RK2"):
-            rows = []
-            for sh in range(n_sh):
-                rows.extend(json.loads(l) for l in open(os.path.join(gdir, f"{tag}_{reg}.sh{sh}.jsonl")) if l.strip())
-            n = len(rows)
-            ok = sum(x["correct"] for x in rows)
-            comp = sum(x["completed"] for x in rows)
-            rep = round(sum(x["repetition"] for x in rows) / max(1, n) * 100.0, 2)
-            out[reg] = {"n": n, "correct": ok, "completed": comp, "acc": round(ok / max(1, n) * 100.0, 2), "rep": rep}
-            tot_ok += ok; tot_comp += comp; max_rep = max(max_rep, rep)
-        out["total_correct"] = tot_ok
-        out["total_completed"] = tot_comp
-        out["mean_acc"] = round(tot_ok / max(1, 3 * len(gate_rows)) * 100.0, 2)
-        out["max_rep"] = max_rep
-        return out
+    with RunLedger(args.work_dir, config=run_config, data_fingerprints=inputs.fingerprints,
+                   initial_checkpoint=initial, resume=args.resume) as run:
+        if run.state["current_gate"] is None:
+            initial_gate_root = Path(args.work_dir) / "gate_init"
+            initial_gate_root.mkdir(parents=True, exist_ok=True)
+            initial_gate_dir = Path(tempfile.mkdtemp(prefix="attempt_", dir=initial_gate_root))
+            gate = evaluate_gate(gpu_ids, str(initial_path), None, 1.0, inputs.gate_rows,
+                                 str(initial_gate_dir), "init", args.gate_max_new_tokens)
+            for artifact in sorted(initial_gate_dir.glob("init_*.jsonl")):
+                run.record_artifact("initial_gate_shard", artifact)
+            run.initialize_gate(gate)
+        if run.state["status"] != "completed":
+            for generation in range(run.state["next_generation"], args.max_gens):
+                if run.state["consecutive_rejections"] >= args.patience:
+                    break
+                gdir = run.begin_generation()
+                cur_model = run.state["current_checkpoint"]["path"]
+                cur_gate = run.state["current_gate"]
+                count = min(args.problems_per_gen, len(inputs.train_rows))
+                start = (generation * count) % len(inputs.train_rows)
+                batch_rows = [inputs.train_rows[(start + index) % len(inputs.train_rows)] for index in range(count)]
+                run.record_training_batch([row["id"] for row in batch_rows])
+                search_gpus = gpu_ids[:min(len(gpu_ids), len(batch_rows))]
+                mp.spawn(_search_worker, args=(search_gpus, cur_model, batch_rows, str(gdir), generation,
+                                               args.max_new_tokens), nprocs=len(search_gpus), join=True)
+                by_id: dict = {}
+                for shard in range(len(search_gpus)):
+                    path = gdir / f"search.shard{shard}.jsonl"
+                    run.record_artifact("rollouts", path)
+                    with path.open() as stream:
+                        for line in stream:
+                            if line.strip():
+                                record = json.loads(line)
+                                by_id.setdefault(record["id"], []).append(record)
+                try:
+                    training_rows, search_stats = prepare_gspo_training_rows(by_id)
+                except EmptyFrontierError as exc:
+                    run.record_no_update("no_frontier", stats=exc.stats)
+                    run.commit_generation()
+                    continue
+                gspo_path = gdir / "gspo_items.jsonl"
+                with gspo_path.open("w") as stream:
+                    for row in training_rows:
+                        stream.write(json.dumps(row, allow_nan=False) + "\n")
+                run.record_artifact("training_items", gspo_path, stats=search_stats)
+                delta_path = gdir / "update_delta.pt"
+                update_gpus = gpu_ids[:min(len(gpu_ids), len(training_rows))]
+                mp.spawn(_ddp_update_worker,
+                         args=(len(update_gpus), update_gpus, cur_model, str(gspo_path), str(delta_path),
+                               args.steps_per_gen, args.lr * (0.9 ** run.state["accepted_generations"]), 3000 + generation),
+                         nprocs=len(update_gpus), join=True)
+                run.record_artifact("update_delta", delta_path)
 
-    cur_model = args.init_model
-    cur_gate = run_gate(cur_model, None, 1.0, os.path.join(args.work_dir, "gate_init"), "init")
-    accepted, consec_reject = 0, 0
-    for g in range(args.max_gens):
-        gdir = os.path.join(args.work_dir, f"gen_{g}")
-        os.makedirs(gdir, exist_ok=True)
-        st = (g * args.problems_per_gen) % max(1, len(train_pool) - args.problems_per_gen)
-        batch_rows = train_pool[st : st + args.problems_per_gen]
-        mp.spawn(_search_worker, args=(gpu_ids, cur_model, batch_rows, gdir, g, 1536), nprocs=len(gpu_ids), join=True)
-        by_id: dict = {}
-        for i in range(len(gpu_ids)):
-            for l in open(os.path.join(gdir, f"search.shard{i}.jsonl")):
-                if l.strip():
-                    rec = json.loads(l)
-                    by_id.setdefault(rec["id"], []).append(rec)
-        groups, _ = compute_loop_advantage_gspo_groups(by_id)
-        gspo_path = os.path.join(gdir, "gspo_items.jsonl")
-        with open(gspo_path, "w") as f:
-            for grp in groups:
-                for it in grp["items"]:
-                    f.write(json.dumps(it) + "\n")
-        delta_path = os.path.join(gdir, f"gspo_gen{g}_delta.pt")
-        mp.spawn(_ddp_update_worker, args=(len(gpu_ids), gpu_ids, cur_model, gspo_path, delta_path, args.steps_per_gen, args.lr * (0.9 ** accepted), 3000 + g), nprocs=len(gpu_ids), join=True)
-
-        best_win = None
-        for sc in (1.0, 0.6):
-            cand = run_gate(cur_model, delta_path, sc, os.path.join(gdir, "gate_eval"), f"g{g}_s{int(sc*10)}")
-            if accept_3regime_rsi_step(cur_gate, cand):
-                if best_win is None or cand["total_correct"] > best_win[1]["total_correct"]:
-                    best_win = (sc, cand)
-        if best_win is not None:
-            sc, cand = best_win
-            accepted += 1
-            next_ckpt = f"{args.ckpt_prefix}-gen{accepted}"
-            d_raw = torch.load(delta_path, map_location="cpu", weights_only=True)
-            if abs(sc - 1.0) > 1e-6:
-                d_raw = {k: v * float(sc) for k, v in d_raw.items()}
-            export_edited_checkpoint(cur_model, next_ckpt, d_raw)
-            cur_model, cur_gate, consec_reject = next_ckpt, cand, 0
-        else:
-            consec_reject += 1
-            if consec_reject >= args.patience:
-                break
-    summary["accepted_gens"] = accepted
-    summary["final_model"] = cur_model
-    summary["final_gate"] = cur_gate
+                winners = []
+                for scale in (1.0, 0.6):
+                    tag = f"g{generation}_s{int(scale * 10)}"
+                    candidate = evaluate_gate(gpu_ids, cur_model, str(delta_path), scale, inputs.gate_rows,
+                                              str(gdir / "gate_eval"), tag,
+                                              args.gate_max_new_tokens)
+                    for artifact in sorted((gdir / "gate_eval").glob(f"{tag}_*.jsonl")):
+                        run.record_artifact("candidate_gate_shard", artifact, scale=scale)
+                    decision = rsi_step_decision(cur_gate, candidate)
+                    run.record_candidate(scale, candidate, **decision)
+                    if decision["accepted"]:
+                        winners.append((scale, candidate))
+                if winners:
+                    scale, _ = max(winners, key=lambda item: (item[1]["total_correct"], item[1]["total_completed"]))
+                    next_checkpoint = Path(f"{args.ckpt_prefix}-gen{run.state['accepted_generations'] + 1}-attempt{run.state['attempt_count']:04d}")
+                    if next_checkpoint.exists():
+                        raise FileExistsError(f"Refusing to overwrite checkpoint: {next_checkpoint}")
+                    delta = torch.load(delta_path, map_location="cpu", weights_only=True)
+                    if scale != 1.0:
+                        delta = {name: value * scale for name, value in delta.items()}
+                    export_edited_checkpoint(cur_model, str(next_checkpoint), delta)
+                    run.commit_generation(checkpoint=next_checkpoint, selected_scale=scale, delta_path=delta_path)
+                else:
+                    run.commit_generation(delta_path=delta_path)
+            run.complete()
+        summary.update(status=run.state["status"], accepted_gens=run.state["accepted_generations"],
+                       final_model=run.state["current_checkpoint"]["path"], final_gate=run.state["current_gate"],
+                       manifest=str(run.manifest_path), event_log=str(run.event_path))
     return summary
 
 

@@ -1,220 +1,203 @@
-"""Mid-stack multi-pass looping wrappers (extended variable-R recurrence & damped RK sub-stepping)."""
+"""Native Inkling recurrence and damped per-layer substeps.
 
+Damping is fixed-point relaxation, not a second-order Runge-Kutta guarantee.
+Each cached substep retains its own previous-token history.
+"""
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from functools import wraps
+from typing import Any, Dict, Optional, Tuple
 import torch
 
 
 @dataclass(frozen=True)
 class LoopConfig:
-    """Configuration for mid-stack looping on a looped MoE transformer."""
-
     num_passes: int = 3
     rk_window: Optional[Tuple[int, int]] = None
     rk_K: int = 1
     rk_beta: float = 0.3
 
     def __post_init__(self) -> None:
-        if self.num_passes < 1:
-            raise ValueError(f"num_passes must be >= 1, got {self.num_passes}")
-        if self.rk_K < 1:
-            raise ValueError(f"rk_K must be >= 1, got {self.rk_K}")
+        if not isinstance(self.num_passes, int) or self.num_passes < 1:
+            raise ValueError("num_passes must be a positive integer")
+        if not isinstance(self.rk_K, int) or self.rk_K < 1:
+            raise ValueError("rk_K must be a positive integer")
         if not (0.0 < self.rk_beta <= 1.0):
-            raise ValueError(f"rk_beta must be in (0, 1], got {self.rk_beta}")
+            raise ValueError("rk_beta must be in (0, 1]")
         if self.rk_window is not None:
             lo, hi = self.rk_window
-            if lo > hi or lo < 0:
+            if not isinstance(lo, int) or not isinstance(hi, int) or lo > hi or lo < 0:
                 raise ValueError(f"Invalid rk_window {self.rk_window}")
 
 
+def _clone_state(value):
+    """Clone mutable cache state without detaching tensors from autograd."""
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, dict):
+        return {k: _clone_state(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_state(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_state(v) for v in value)
+    return copy.copy(value)
+
+
 def snapshot_cache_layer(cache: Any, cache_idx: int) -> Optional[Dict[str, Any]]:
-    """Snapshot KV and dict/tensor short-convolution cache state for a single cache slot."""
+    """Capture a complete slot, including lazy initialization and conv counters."""
     if cache is None:
         return None
-    snap: Dict[str, Any] = {}
-    if hasattr(cache, "layers") and cache_idx < len(cache.layers):
-        layer = cache.layers[cache_idx]
-        if hasattr(layer, "keys") and layer.keys is not None:
-            snap["keys"] = layer.keys.clone()
-        if hasattr(layer, "values") and layer.values is not None:
-            snap["values"] = layer.values.clone()
-    if hasattr(cache, "conv_states") and isinstance(cache.conv_states, dict) and cache_idx in cache.conv_states:
-        cs = cache.conv_states[cache_idx]
-        snap["conv_state"] = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in cs.items()} if isinstance(cs, dict) else cs.clone()
-    elif hasattr(cache, "conv_states") and isinstance(cache.conv_states, list) and cache_idx < len(cache.conv_states):
-        cs = cache.conv_states[cache_idx]
-        if cs is not None:
-            snap["conv_state"] = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in cs.items()} if isinstance(cs, dict) else cs.clone()
+    if not hasattr(cache, "layers") or not 0 <= cache_idx < len(cache.layers):
+        raise ValueError(f"Cache slot {cache_idx} does not exist")
+    snap = {"layer_state": _clone_state(vars(cache.layers[cache_idx]))}
+    conv = getattr(cache, "conv_states", None)
+    if isinstance(conv, (dict, list)):
+        present = cache_idx in conv if isinstance(conv, dict) else cache_idx < len(conv)
+        snap["external_conv_present"] = present
+        if present:
+            snap["external_conv"] = _clone_state(conv[cache_idx])
     return snap
 
 
 def restore_cache_layer(cache: Any, cache_idx: int, snap: Optional[Dict[str, Any]]) -> None:
-    """Restore a snapshotted KV and short-convolution cache slot without mutating external refs."""
+    """Restore all slot state, including the absence of lazily initialized tensors."""
     if cache is None or snap is None:
         return
-    if hasattr(cache, "layers") and cache_idx < len(cache.layers):
-        layer = cache.layers[cache_idx]
-        if "keys" in snap:
-            layer.keys = snap["keys"].clone()
-        if "values" in snap:
-            layer.values = snap["values"].clone()
-    if "conv_state" in snap and hasattr(cache, "conv_states"):
-        cs = snap["conv_state"]
-        restored = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in cs.items()} if isinstance(cs, dict) else cs.clone()
-        cache.conv_states[cache_idx] = restored
+    state = vars(cache.layers[cache_idx])
+    state.clear()
+    state.update(_clone_state(snap["layer_state"]))
+    conv = getattr(cache, "conv_states", None)
+    if snap.get("external_conv_present"):
+        if isinstance(conv, list):
+            while len(conv) <= cache_idx:
+                conv.append(None)
+        conv[cache_idx] = _clone_state(snap["external_conv"])
+    elif isinstance(conv, dict):
+        conv.pop(cache_idx, None)
+    elif isinstance(conv, list) and cache_idx < len(conv):
+        conv[cache_idx] = None
+
+
+def _swap_slots(cache, left, right):
+    cache.layers[left], cache.layers[right] = cache.layers[right], cache.layers[left]
+    conv = getattr(cache, "conv_states", None)
+    if isinstance(conv, dict):
+        missing = object()
+        a, b = conv.pop(left, missing), conv.pop(right, missing)
+        if b is not missing:
+            conv[left] = b
+        if a is not missing:
+            conv[right] = a
+    elif isinstance(conv, list):
+        while len(conv) <= max(left, right):
+            conv.append(None)
+        conv[left], conv[right] = conv[right], conv[left]
 
 
 def run_damped_rk_layer(
-    layer_fn,
-    h: torch.Tensor,
-    rk_K: int = 1,
-    rk_beta: float = 0.3,
-    cache: Any = None,
-    cache_idx: int = 0,
+    layer_fn, h: torch.Tensor, rk_K: int = 1, rk_beta: float = 0.3,
+    cache: Any = None, cache_idx: int = 0,
 ) -> torch.Tensor:
-    """Execute one decoder layer with K-stage damped Runge-Kutta sub-stepping.
+    """Apply K damped substeps; K=1 is exactly one native layer call.
 
-    When rk_K == 1 or rk_beta == 1.0 (with K == 1), reduces bit-for-bit to layer_fn(h).
-    Intermediate stages k < K-1 run on snapshotted cache state and restore before the final step.
+    Extra stage slots live in the native cache container so crop/reorder also
+    handles their histories. A regime change requires a fresh dynamic cache.
     """
     if rk_K <= 1:
         return layer_fn(h)
-
-    snap = snapshot_cache_layer(cache, cache_idx)
+    LoopConfig(rk_K=rk_K, rk_beta=rk_beta)
+    stage_slots, snapshots = (), {}
+    original_length, created = 0, False
+    key = (cache_idx, rk_K, float(rk_beta))
+    if cache is not None:
+        if getattr(cache, "offloading", False) or getattr(cache, "is_compileable", False):
+            raise ValueError("Damped substeps require an eager, non-offloaded dynamic cache")
+        base = snapshot_cache_layer(cache, cache_idx)
+        original_length = len(cache.layers)
+        stages = getattr(cache, "_rse_damped_slots", {})
+        if key not in stages:
+            slot = cache.layers[cache_idx]
+            if hasattr(slot, "get_seq_length") and slot.get_seq_length() != 0:
+                raise ValueError("Changing a loop configuration requires a fresh cache")
+            if any(k[0] == cache_idx for k in stages):
+                raise ValueError("Changing damped substeps requires a fresh cache")
+            stage_slots = tuple(range(original_length, original_length + rk_K - 1))
+            for idx in stage_slots:
+                cache.layers.append(copy.copy(slot))
+                cache.layers[idx].__dict__ = {}
+                restore_cache_layer(cache, idx, base)
+            stages[key] = stage_slots
+            cache._rse_damped_slots = stages
+            created = True
+        else:
+            stage_slots = stages[key]
+        snapshots = {idx: snapshot_cache_layer(cache, idx) for idx in (cache_idx, *stage_slots)}
     cur = h
-    for k in range(rk_K - 1):
-        out = layer_fn(cur)
-        cur = cur + float(rk_beta) * (out - cur)
-        restore_cache_layer(cache, cache_idx, snap)
-    final_out = layer_fn(cur)
-    if rk_beta == 1.0:
-        return final_out
-    return cur + float(rk_beta) * (final_out - cur)
+    try:
+        for k in range(rk_K):
+            provisional = cache is not None and k < rk_K - 1
+            if provisional:
+                _swap_slots(cache, cache_idx, stage_slots[k])
+            try:
+                out = layer_fn(cur)
+            finally:
+                if provisional:
+                    _swap_slots(cache, cache_idx, stage_slots[k])
+            cur = cur + float(rk_beta) * (out - cur) if rk_beta != 1.0 else out
+        return cur
+    except Exception:
+        for idx, snap in snapshots.items():
+            restore_cache_layer(cache, idx, snap)
+        if cache is not None and created:
+            del cache.layers[original_length:]
+            cache._rse_damped_slots.pop(key)
+            conv = getattr(cache, "conv_states", None)
+            if isinstance(conv, dict):
+                for idx in stage_slots:
+                    conv.pop(idx, None)
+            elif isinstance(conv, list):
+                del conv[original_length:]
+        raise
 
 
 def install_midstack_loop_forward(model: torch.nn.Module, cfg: LoopConfig) -> None:
-    """Install variable-R mid-stack recurrence and optional damped RK sub-stepping on Inkling2LoopForCausalLM."""
-    from transformers.masking_utils import (
-        create_causal_mask,
-        create_recurrent_attention_mask,
-        create_sliding_window_causal_mask,
-    )
-    from transformers.modeling_outputs import BaseModelOutputWithPast
-    from transformers.models.inkling2_loop.modeling_inkling2_loop import (
-        Inkling2LoopCache,
-        get_relative_distance,
-    )
-    import types
+    """Keep native masks, recurrence, output types and cache indexing intact.
 
+    Only selected decoder layers receive removable wrappers for damped substeps.
+    Reinstalling a normal mode removes those wrappers.
+    """
     tm = model.model if hasattr(model, "model") else model
-    tm.config.loop_num_passes = cfg.num_passes
+    config = tm.config
+    required = ("loop_layer_index_start", "loop_layer_index_end", "loop_num_passes")
+    if not all(hasattr(config, name) for name in required) or not hasattr(tm, "layers"):
+        raise TypeError("Expected the supported upstream Inkling2Loop text model")
+    if cfg.rk_window is not None and cfg.rk_window[1] >= len(tm.layers):
+        raise ValueError("rk_window extends past the model's decoder layers")
+    for layer in tm.layers:
+        if hasattr(layer, "_rse_original_forward"):
+            layer.forward = layer._rse_original_forward
+            delattr(layer, "_rse_original_forward")
+    config.loop_num_passes = cfg.num_passes
     if hasattr(model, "config"):
         model.config.loop_num_passes = cfg.num_passes
+    tm._rse_loop_config = cfg
+    if cfg.rk_window is None or cfg.rk_K == 1:
+        return
 
-    def custom_forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        cache_position=None,
-        **kwargs,
-    ):
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-        if use_cache and past_key_values is None:
-            past_key_values = Inkling2LoopCache(config=self.config)
-        if cache_position is None:
-            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(past_seen, past_seen + inputs_embeds.shape[1], device=inputs_embeds.device)
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+    def wrap(original, layer_idx):
+        @wraps(original)
+        def damped(hidden_states, *args, **kwargs):
+            cache = kwargs.get("cache", kwargs.get("past_key_values"))
+            cache_idx = layer_idx + kwargs.get("cache_offset", 0)
+            return run_damped_rk_layer(
+                lambda x: original(x, *args, **kwargs), hidden_states,
+                rk_K=cfg.rk_K, rk_beta=cfg.rk_beta, cache=cache, cache_idx=cache_idx,
+            )
+        return damped
 
-        mk = {
-            "config": self.config,
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache": past_key_values,
-            "position_ids": position_ids,
-        }
-        cm = {
-            "full_attention": create_causal_mask(**mk),
-            "sliding_attention": create_sliding_window_causal_mask(**mk),
-            "linear_attention": create_recurrent_attention_mask(**mk),
-        }
-        rd = {
-            "full_attention": get_relative_distance(inputs_embeds, past_key_values, is_sliding=False),
-            "sliding_attention": get_relative_distance(inputs_embeds, past_key_values, is_sliding=True),
-        }
-
-        h = inputs_embeds
-        blocks = inputs_embeds.new_zeros(*inputs_embeds.shape[:-1], 0, inputs_embeds.shape[-1])
-        start_l = self.config.loop_start_layer
-        end_l = start_l + self.config.loop_num_layers
-        n_layers = len(self.layers)
-
-        def call_layer(lidx, cur_h, cur_b, msgs, c_idx):
-            dl = self.layers[lidx]
-            use_rk = cfg.rk_window is not None and cfg.rk_K > 1 and (cfg.rk_window[0] <= lidx <= cfg.rk_window[1])
-            def fn(x):
-                return dl(
-                    x, cur_b, msgs,
-                    attention_mask=cm[dl.attention_type],
-                    relative_distance=rd[dl.attention_type],
-                    conv_mask=cm["linear_attention"],
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    cache_position=cache_position,
-                    cache_layer_idx=c_idx,
-                    **kwargs,
-                )
-            return run_damped_rk_layer(fn, cur_h, rk_K=cfg.rk_K if use_rk else 1, rk_beta=cfg.rk_beta, cache=past_key_values, cache_idx=c_idx)
-
-        c_idx = 0
-        for lidx in range(start_l):
-            nh = call_layer(lidx, h, blocks, None, c_idx)
-            if self.layers[lidx].is_block_boundary:
-                blocks = torch.cat([blocks, h.unsqueeze(-2)], dim=-2)
-            h = nh
-            c_idx += 1
-
-        pre_h, pre_b = h, blocks
-        n_pre = pre_b.shape[-2]
-
-        for lidx in range(start_l, end_l):
-            nh = call_layer(lidx, h, blocks, None, c_idx)
-            if self.layers[lidx].is_block_boundary:
-                blocks = torch.cat([blocks, h.unsqueeze(-2)], dim=-2)
-            h = nh
-            c_idx += 1
-
-        for _loop_idx in range(1, cfg.num_passes):
-            prev_b = blocks[..., n_pre + 1 :, :]
-            prev_h = h
-            h, blocks = pre_h, pre_b
-            for off, lidx in enumerate(range(start_l, end_l)):
-                msgs = self.message_input(prev_b, prev_h, off)
-                nh = call_layer(lidx, h, blocks, msgs, c_idx)
-                if self.layers[lidx].is_block_boundary:
-                    blocks = torch.cat([blocks, h.unsqueeze(-2)], dim=-2)
-                h = nh
-                c_idx += 1
-
-        for lidx in range(end_l, n_layers):
-            nh = call_layer(lidx, h, blocks, None, c_idx)
-            if self.layers[lidx].is_block_boundary:
-                blocks = torch.cat([blocks, h.unsqueeze(-2)], dim=-2)
-            h = nh
-            c_idx += 1
-
-        h = self.final_input(blocks, h)
-        h = self.norm(h)
-        return BaseModelOutputWithPast(last_hidden_state=h, past_key_values=past_key_values)
-
-    tm.forward = types.MethodType(custom_forward, tm)
+    for idx in range(cfg.rk_window[0], cfg.rk_window[1] + 1):
+        layer = tm.layers[idx]
+        layer._rse_original_forward = layer.forward
+        layer.forward = wrap(layer.forward, idx)
