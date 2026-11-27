@@ -1,0 +1,33 @@
+{
+  "model_architecture": "thinkingmachines/Inkling-2-Mini",
+  "logical_total_params": 26386412544,
+  "logical_text_params": 26068156416,
+  "safetensors_keys": 1244,
+  "fpsolve": {
+    "checkpoint": "Inkling-2-Mini-FPSolve",
+    "zero_backprop": true,
+    "zero_labels": true,
+    "solve_time_sec": 353.0,
+    "total_keys": 1244,
+    "changed_keys": 168,
+    "expert_keys_changed": 0,
+    "vision_keys_changed": 0,
+    "mean_rel_change": 0.24609,
+    "max_rel_change": 0.25007,
+    "pass_cos_R6": [
+      0.9347,
+      0.2306,
+      0.9488,
+      0.9718,
+      0.9886
+    ]
+  },
+  "multi_gen_gspo": {
+    "total_keys": 1244,
+    "changed_keys": 327,
+    "expert_keys_changed": 0,
+    "vision_keys_changed": 0,
+    "mean_rel_change": 0.00843,
+    "max_rel_change": 0.0344
+  }
+}

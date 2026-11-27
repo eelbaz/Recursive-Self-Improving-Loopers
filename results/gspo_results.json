@@ -1,0 +1,366 @@
+{
+  "method": "Multi-Generation Loop-Advantage GSPO (0 External Teacher)",
+  "gate_size_per_mode": 64,
+  "total_gate_evals": 192,
+  "init_gate": {
+    "R3": {
+      "acc": 54.69,
+      "correct": 35
+    },
+    "R4": {
+      "acc": 57.81,
+      "correct": 37
+    },
+    "RK2": {
+      "acc": 60.94,
+      "correct": 39
+    },
+    "total_correct": 111,
+    "mean_acc": 57.81,
+    "mean_comp": 66.15,
+    "max_rep": 1.56
+  },
+  "generations": [
+    {
+      "gen": 0,
+      "search": {
+        "best_of_6_rate": 69.79,
+        "active_frontier_groups": 31,
+        "deep_loop_rescue_groups": 9,
+        "pass1_by_regime": {
+          "R3": 53.12,
+          "R4": 54.69,
+          "RK2": 53.12
+        }
+      },
+      "ddp_sec": 143.1,
+      "mean_rel_delta": 0.00159,
+      "candidates": [
+        {
+          "scale": 1.0,
+          "R3": 60.94,
+          "R4": 62.5,
+          "RK2": 54.69,
+          "mean_acc": 59.38,
+          "total_correct": 114,
+          "mean_comp": 69.79,
+          "max_rep": 0.0
+        },
+        {
+          "scale": 0.6,
+          "R3": 56.25,
+          "R4": 59.38,
+          "RK2": 59.38,
+          "mean_acc": 58.33,
+          "total_correct": 112,
+          "mean_comp": 68.23,
+          "max_rep": 1.56
+        }
+      ],
+      "accepted": true,
+      "winner_scale": 0.6
+    },
+    {
+      "gen": 1,
+      "search": {
+        "best_of_6_rate": 64.58,
+        "active_frontier_groups": 27,
+        "deep_loop_rescue_groups": 6,
+        "pass1_by_regime": {
+          "R3": 53.12,
+          "R4": 50.52,
+          "RK2": 49.48
+        }
+      },
+      "ddp_sec": 139.6,
+      "mean_rel_delta": 0.00133,
+      "candidates": [
+        {
+          "scale": 1.0,
+          "R3": 57.81,
+          "R4": 59.38,
+          "RK2": 56.25,
+          "mean_acc": 57.81,
+          "total_correct": 111,
+          "mean_comp": 66.15,
+          "max_rep": 1.56
+        },
+        {
+          "scale": 0.6,
+          "R3": 62.5,
+          "R4": 62.5,
+          "RK2": 53.12,
+          "mean_acc": 59.38,
+          "total_correct": 114,
+          "mean_comp": 69.27,
+          "max_rep": 1.56
+        }
+      ],
+      "accepted": true,
+      "winner_scale": 0.6
+    },
+    {
+      "gen": 2,
+      "search": {
+        "best_of_6_rate": 68.75,
+        "active_frontier_groups": 27,
+        "deep_loop_rescue_groups": 8,
+        "pass1_by_regime": {
+          "R3": 54.17,
+          "R4": 54.69,
+          "RK2": 54.17
+        }
+      },
+      "ddp_sec": 141.3,
+      "mean_rel_delta": 0.00124,
+      "candidates": [
+        {
+          "scale": 1.0,
+          "R3": 54.69,
+          "R4": 59.38,
+          "RK2": 62.5,
+          "mean_acc": 58.85,
+          "total_correct": 113,
+          "mean_comp": 70.31,
+          "max_rep": 1.56
+        },
+        {
+          "scale": 0.6,
+          "R3": 57.81,
+          "R4": 64.06,
+          "RK2": 62.5,
+          "mean_acc": 61.46,
+          "total_correct": 118,
+          "mean_comp": 70.83,
+          "max_rep": 1.56
+        }
+      ],
+      "accepted": true,
+      "winner_scale": 0.6
+    },
+    {
+      "gen": 3,
+      "search": {
+        "best_of_6_rate": 75.0,
+        "active_frontier_groups": 29,
+        "deep_loop_rescue_groups": 7,
+        "pass1_by_regime": {
+          "R3": 63.02,
+          "R4": 64.06,
+          "RK2": 58.33
+        }
+      },
+      "ddp_sec": 140.7,
+      "mean_rel_delta": 0.00123,
+      "candidates": [
+        {
+          "scale": 1.0,
+          "R3": 62.5,
+          "R4": 62.5,
+          "RK2": 53.12,
+          "mean_acc": 59.38,
+          "total_correct": 114,
+          "mean_comp": 71.35,
+          "max_rep": 0.0
+        },
+        {
+          "scale": 0.6,
+          "R3": 62.5,
+          "R4": 57.81,
+          "RK2": 57.81,
+          "mean_acc": 59.38,
+          "total_correct": 114,
+          "mean_comp": 69.27,
+          "max_rep": 1.56
+        }
+      ],
+      "accepted": true,
+      "winner_scale": 1.0
+    },
+    {
+      "gen": 4,
+      "search": {
+        "best_of_6_rate": 68.75,
+        "active_frontier_groups": 28,
+        "deep_loop_rescue_groups": 6,
+        "pass1_by_regime": {
+          "R3": 55.73,
+          "R4": 55.73,
+          "RK2": 50.0
+        }
+      },
+      "ddp_sec": 142.5,
+      "mean_rel_delta": 0.00105,
+      "candidates": [
+        {
+          "scale": 1.0,
+          "R3": 56.25,
+          "R4": 60.94,
+          "RK2": 64.06,
+          "mean_acc": 60.42,
+          "total_correct": 116,
+          "mean_comp": 70.83,
+          "max_rep": 1.56
+        }
+      ],
+      "accepted": true,
+      "winner_scale": 1.0
+    }
+  ],
+  "merged_gate": {
+    "R3": 60.94,
+    "R4": 62.5,
+    "RK2": 64.06,
+    "mean_acc": 62.5,
+    "total_correct": 120,
+    "mean_comp": 71.35,
+    "max_rep": 1.56
+  },
+  "integrity": {
+    "total_keys": 1244,
+    "changed_keys": 327,
+    "experts_changed": 0,
+    "vision_changed": 0,
+    "mean_rel_change": 0.00843,
+    "max_rel_change": 0.0344
+  },
+  "blind_benchmarks": {
+    "deepscaler_R3": {
+      "name": "gspo_test_R3",
+      "n": 64,
+      "accuracy": 68.75,
+      "completion_rate": 79.69,
+      "acc_given_completed": 86.27,
+      "repetition_rate": 0.0,
+      "avg_tokens": 989.7
+    },
+    "deepscaler_R4": {
+      "name": "gspo_test_R4",
+      "n": 64,
+      "accuracy": 70.31,
+      "completion_rate": 78.12,
+      "acc_given_completed": 90.0,
+      "repetition_rate": 0.0,
+      "avg_tokens": 968.4
+    },
+    "deepscaler_R5": {
+      "name": "gspo_test_R5",
+      "n": 64,
+      "accuracy": 65.62,
+      "completion_rate": 78.12,
+      "acc_given_completed": 84.0,
+      "repetition_rate": 0.0,
+      "avg_tokens": 956.2
+    },
+    "deepscaler_RK2": {
+      "name": "gspo_test_RK2",
+      "n": 64,
+      "accuracy": 62.5,
+      "completion_rate": 71.88,
+      "acc_given_completed": 86.96,
+      "repetition_rate": 0.0,
+      "avg_tokens": 1015.0
+    },
+    "olympiad_R3": {
+      "name": "gspo_oly_R3",
+      "n": 64,
+      "accuracy": 32.81,
+      "completion_rate": 40.62,
+      "acc_given_completed": 80.77,
+      "repetition_rate": 0.0,
+      "avg_tokens": 1651.6
+    },
+    "olympiad_R4": {
+      "name": "gspo_oly_R4",
+      "n": 64,
+      "accuracy": 34.38,
+      "completion_rate": 39.06,
+      "acc_given_completed": 88.0,
+      "repetition_rate": 1.56,
+      "avg_tokens": 1660.4
+    },
+    "olympiad_RK2": {
+      "name": "gspo_oly_RK2",
+      "n": 64,
+      "accuracy": 26.56,
+      "completion_rate": 40.62,
+      "acc_given_completed": 65.38,
+      "repetition_rate": 0.0,
+      "avg_tokens": 1642.3
+    },
+    "livecode_R3": {
+      "name": "gspo_lcb_R3",
+      "n": 32,
+      "accuracy": 40.62,
+      "completion_rate": 43.75,
+      "repetition_rate": 0.0,
+      "avg_tokens": 1367.5
+    },
+    "livecode_R4": {
+      "name": "gspo_lcb_R4",
+      "n": 32,
+      "accuracy": 40.62,
+      "completion_rate": 40.62,
+      "repetition_rate": 0.0,
+      "avg_tokens": 1397.7
+    },
+    "general_R3": {
+      "mmlu": {
+        "acc": 83.51,
+        "correct": 238,
+        "n": 285
+      },
+      "arc_challenge": {
+        "acc": 94.0,
+        "correct": 282,
+        "n": 300
+      },
+      "hellaswag": {
+        "acc": 61.0,
+        "correct": 183,
+        "n": 300
+      },
+      "winogrande": {
+        "acc": 67.0,
+        "correct": 201,
+        "n": 300
+      },
+      "gsm8k": {
+        "acc": 94.53,
+        "comp": 98.44,
+        "rep": 0.78,
+        "n": 128
+      },
+      "elapsed_sec": 1288.4
+    },
+    "general_R4": {
+      "mmlu": {
+        "acc": 83.16,
+        "correct": 237,
+        "n": 285
+      },
+      "arc_challenge": {
+        "acc": 93.67,
+        "correct": 281,
+        "n": 300
+      },
+      "hellaswag": {
+        "acc": 63.33,
+        "correct": 190,
+        "n": 300
+      },
+      "winogrande": {
+        "acc": 64.67,
+        "correct": 194,
+        "n": 300
+      },
+      "gsm8k": {
+        "acc": 96.09,
+        "comp": 98.44,
+        "rep": 0.0,
+        "n": 128
+      },
+      "elapsed_sec": 1508.2
+    }
+  }
+}

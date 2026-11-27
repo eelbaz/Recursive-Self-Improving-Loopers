@@ -1,0 +1,154 @@
+{
+  "method": "FP-Solve (Closed-Form Null-Space Cholesky, 0 Backprop, 0 Labels)",
+  "solve_time_sec": 353.0,
+  "matrices_edited": 168,
+  "experts_changed": 0,
+  "pass_cos_r6": [
+    0.9347,
+    0.2306,
+    0.9488,
+    0.9718,
+    0.9886
+  ],
+  "recursive_2gen_val_scores": [
+    43.259,
+    46.312,
+    49.808
+  ],
+  "recursive_gen1_pass_cos_r6": [
+    0.9352,
+    0.2374,
+    0.9526,
+    0.9786,
+    0.9921
+  ],
+  "blind_benchmarks": {
+    "deepscaler_R3": {
+      "name": "fpsolve_test_R3",
+      "n": 64,
+      "accuracy": 50.0,
+      "completion_rate": 54.69,
+      "acc_given_completed": 91.43,
+      "repetition_rate": 1.56,
+      "avg_tokens": 1354.7
+    },
+    "deepscaler_R4": {
+      "name": "fpsolve_test_R4",
+      "n": 64,
+      "accuracy": 42.19,
+      "completion_rate": 50.0,
+      "acc_given_completed": 84.38,
+      "repetition_rate": 0.0,
+      "avg_tokens": 1402.6
+    },
+    "deepscaler_R5": {
+      "name": "fpsolve_test_R5",
+      "n": 64,
+      "accuracy": 34.38,
+      "completion_rate": 42.19,
+      "acc_given_completed": 81.48,
+      "repetition_rate": 4.69,
+      "avg_tokens": 1483.4
+    },
+    "livecode_R3": {
+      "name": "fpsolve_lcb_R3",
+      "n": 32,
+      "accuracy": 37.5,
+      "completion_rate": 37.5,
+      "repetition_rate": 3.12,
+      "avg_tokens": 1503.5
+    },
+    "livecode_R4": {
+      "name": "fpsolve_lcb_R4",
+      "n": 32,
+      "accuracy": 37.5,
+      "completion_rate": 37.5,
+      "repetition_rate": 3.12,
+      "avg_tokens": 1483.9
+    },
+    "base_livecode_R3": {
+      "name": "base_lcb_R3",
+      "n": 32,
+      "accuracy": 34.38,
+      "completion_rate": 34.38,
+      "repetition_rate": 0.0,
+      "avg_tokens": 1501.1
+    },
+    "olympiad_R3": {
+      "name": "fpsolve_oly_R3",
+      "n": 64,
+      "accuracy": 21.88,
+      "completion_rate": 21.88,
+      "acc_given_completed": 100.0,
+      "repetition_rate": 3.12,
+      "avg_tokens": 1894.7
+    },
+    "olympiad_R4": {
+      "name": "fpsolve_oly_R4",
+      "n": 64,
+      "accuracy": 17.19,
+      "completion_rate": 17.19,
+      "acc_given_completed": 100.0,
+      "repetition_rate": 4.69,
+      "avg_tokens": 1913.1
+    },
+    "general_R3": {
+      "mmlu": {
+        "acc": 81.4,
+        "correct": 232,
+        "n": 285
+      },
+      "arc_challenge": {
+        "acc": 94.33,
+        "correct": 283,
+        "n": 300
+      },
+      "hellaswag": {
+        "acc": 61.67,
+        "correct": 185,
+        "n": 300
+      },
+      "winogrande": {
+        "acc": 70.0,
+        "correct": 210,
+        "n": 300
+      },
+      "gsm8k": {
+        "acc": 96.88,
+        "comp": 98.44,
+        "rep": 0.0,
+        "n": 128
+      },
+      "elapsed_sec": 1453.4
+    },
+    "general_R4": {
+      "mmlu": {
+        "acc": 81.05,
+        "correct": 231,
+        "n": 285
+      },
+      "arc_challenge": {
+        "acc": 93.0,
+        "correct": 279,
+        "n": 300
+      },
+      "hellaswag": {
+        "acc": 61.33,
+        "correct": 184,
+        "n": 300
+      },
+      "winogrande": {
+        "acc": 67.0,
+        "correct": 201,
+        "n": 300
+      },
+      "gsm8k": {
+        "acc": 95.31,
+        "comp": 96.88,
+        "rep": 0.0,
+        "n": 128
+      },
+      "elapsed_sec": 1795.0
+    }
+  }
+}

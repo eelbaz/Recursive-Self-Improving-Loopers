@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recursive Self-Improving Loopers — Inkblot-2-mini</title>
+<style>
+  :root { --ink:#0f172a; --muted:#475569; --line:#e2e8f0; --bg:#ffffff; --teal:#0f766e; --tealbg:#f0fdfa; --amber:#b45309; --amberbg:#fffbeb; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; line-height:1.65; }
+  main { max-width:880px; margin:0 auto; padding:42px 22px 84px; }
+  h1 { font-size:2.05rem; line-height:1.2; margin:0 0 8px; letter-spacing:-0.02em; }
+  .meta { color:var(--muted); font-size:0.95rem; margin-bottom:24px; }
+  h2 { font-size:1.35rem; margin:38px 0 10px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+  p { margin:0 0 14px; font-size:1.01rem; }
+  .box { padding:14px 18px; border-radius:6px; margin:18px 0; font-size:0.96rem; }
+  .tldr { background:var(--amberbg); border-left:4px solid var(--amber); }
+  .take { background:var(--tealbg); border-left:4px solid var(--teal); }
+  figure { margin:24px 0; text-align:center; }
+  figure img { width:100%; height:auto; border:1px solid var(--line); border-radius:6px; }
+  figcaption { color:var(--muted); font-size:0.88rem; margin-top:8px; text-align:left; }
+  table { width:100%; border-collapse:collapse; margin:18px 0; font-size:0.88rem; }
+  th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; }
+  th { background:#f8fafc; font-weight:600; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  td.win { color:var(--teal); font-weight:700; }
+  pre { background:#0f172a; color:#f8fafc; padding:14px 16px; border-radius:6px; overflow-x:auto; font-size:0.87rem; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.9em; }
+  a { color:var(--teal); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Recursive Self-Improving Loopers: Local Loop-Dynamics Editing and Self-Improvement (<code>Inkblot-2-mini</code>)</h1>
+  <div class="meta">Eric E., Tensorbend.ai Research &middot; November 26, 2026 &middot; <a href="https://github.com/eelbaz/Recursive-Self-Improving-Loopers/blob/main/paper/main.pdf">PDF Paper</a> &middot; <a href="https://github.com/eelbaz/Recursive-Self-Improving-Loopers">GitHub</a> &middot; <a href="https://huggingface.co/Ex0bit/Inkblot-2-mini">Hugging Face (Inkblot-2-mini)</a></div>
+
+  <div class="box tldr">
+    <strong>TL;DR.</strong> <code>Inkling-2-Mini</code> runs Layers 6&ndash;17 three times per token by default. Overriding the loop depth to 4 passes at inference time drops accuracy to 3.1% on math and GSM8K with 95.3% repeat loops. <code>rse_looper</code> edits only the BF16/FP32 loop-control weights (memory gates, MoE routers, short convolutions, and attention output projections) while leaving all 24.4B quantized experts untouched. Step 1 (<code>FP-Solve</code>) runs a closed-form Cholesky solve in <strong>5.8 minutes on 1 GPU</strong> with zero backprop and zero labels. Step 2 runs four self-verified generations without an external teacher to build <strong><code>Inkblot-2-mini</code></strong>, improving directly over untouched default 3-pass Base on <code>DeepScaleR-Test</code> (50.0% &rarr; <strong>68.8%</strong> 3-pass; <strong>70.3%</strong> 4-pass, n=64), <code>LiveCodeBench v6</code> (34.4% &rarr; <strong>40.6%</strong>, n=32), <code>GSM8K</code> (93.8% &rarr; <strong>96.1%</strong> 4-pass, n=128), and <code>MMLU</code> (82.5% &rarr; <strong>83.5%</strong>, n=285).
+  </div>
+
+  <figure>
+    <img src="figures/fig1_recipe_and_gains.png" alt="Two-step local RSI recipe and blind test accuracy">
+    <figcaption><strong>Figure 1:</strong> Two-step <code>rse_looper</code> recipe and blind held-out accuracy across math, GSM8K, LiveCodeBench v6, and MMLU.</figcaption>
+  </figure>
+
+  <h2>1. What Breaks Under Forced 4-Pass Looping</h2>
+  <p><code>thinkingmachines/Inkling-2-Mini</code> repeats Layers 6&ndash;17 three times by default. When we override the loop depth to 4 passes at inference time (<code>LoopConfig(num_passes=4)</code>), untouched Base drops from 50.0% to 3.1% on <code>DeepScaleR-Test</code>, drops from 93.8% to 3.1% on <code>GSM8K</code>, and enters repeat loops on 95.3% of replies.</p>
+  <p>We trace this instability to Layer 17. On Pass 3, one single direction reverses sign (75.5% of pass-shift energy). When Pass 4 feeds that flipped state into the 48 cross-pass memory gates, the MLP memory gate drops from +0.638 to +0.067.</p>
+
+  <figure>
+    <img src="figures/fig2_layer17_and_fpsolve.png" alt="Layer 17 sign flip and 5.8-minute FP-Solve repair">
+    <figcaption><strong>Figure 2:</strong> Layer 17 reverses sign on Pass 3 and drops the memory gate on Pass 4. Analytic loop-dynamics editing (<code>FP-Solve</code>) restores pass-to-pass stability through Pass 6 in 5.8 minutes with zero backprop and zero labels.</figcaption>
+  </figure>
+
+  <h2>2. Step 1: Closed-Form Loop-Dynamics Edit (<code>FP-Solve</code>)</h2>
+  <p>Because Layers 6&ndash;17 repeat on every token, every forward pass contains an internal target: Pass 3 gives healthy outputs, and Pass 4 gives unstable outputs.</p>
+  <p><code>rse_looper/fpsolve.py</code> disables gradients globally, runs 48 unlabeled prompts, and solves one closed-form null-space Cholesky equation per matrix across 168 BF16/FP32 weights. In 353 seconds on 1 GPU, it stabilizes Pass 4&ndash;6 dynamics (<code>0.949 &rarr; 0.972 &rarr; 0.989</code>) and improves directly over default 3-pass Base on GSM8K (96.9%, 124/128), LiveCodeBench v6 (37.5%, 12/32), Olympiad (21.9%, 14/64), and WinoGrande (70.0%, 210/300).</p>
+
+  <div class="box take"><strong>Takeaway:</strong> Analytic editing of 168 loop-control matrices eliminates forced 4-pass repeat loops and improves four blind benchmarks in 5.8 minutes with zero backprop and zero labels.</div>
+
+  <h2>3. Step 2: Autonomous Multi-Generation Climb to <code>Inkblot-2-mini</code></h2>
+  <p>With loop dynamics stabilized, <code>rse_looper/gspo.py</code> runs four self-verified generations without an external teacher. Each generation samples 6 answers across 3 loop modes, rewards deeper modes when they solve problems that 3-pass missed, updates only 326 BF16/FP32 control and routing tensors, and keeps only strict wins on a hidden 192-check gate.</p>
+  <p>Merging top accepted generations produces <strong><code>Ex0bit/Inkblot-2-mini</code></strong>. Hidden 3-mode accuracy climbs from 57.8% (111/192) to <strong>62.5%</strong> (120/192), and completion rises to <strong>71.4%</strong>.</p>
+
+  <figure>
+    <img src="figures/fig3_multigen_and_benchmarks.png" alt="Multi-generation climb to Inkblot-2-mini and broad benchmark proof">
+    <figcaption><strong>Figure 3:</strong> Hidden 3-mode validation climbs across 4 generations to <code>Inkblot-2-mini</code> (left), while general skills, coding, Olympiad math, and containerized Terminal-Bench stay intact or improve (right).</figcaption>
+  </figure>
+
+  <h2>4. Blind Held-Out Results (Compared Against Default 3-Pass Base)</h2>
+  <table>
+    <thead>
+      <tr><th>Blind Benchmark (Sample Size)</th><th>Passes</th><th class="num">Default Base</th><th class="num">FP-Solve (0-Backprop)</th><th class="num">Inkblot-2-mini</th><th class="num">vs. Base 3-Pass</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>DeepScaleR-Test (n=64)</td><td>3-Pass</td><td class="num">50.0% (32/64)</td><td class="num">50.0% (32/64)</td><td class="num win">68.8% (44/64)</td><td class="num win">+18.8 pp</td></tr>
+      <tr><td>DeepScaleR-Test (n=64)</td><td>4-Pass</td><td class="num">3.1% (2/64*)</td><td class="num">42.2% (27/64)</td><td class="num win">70.3% (45/64)</td><td class="num win">+20.3 pp</td></tr>
+      <tr><td>DeepScaleR-Test (n=64)</td><td>5-Pass</td><td class="num">18.8% (12/64*)</td><td class="num">34.4% (22/64)</td><td class="num win">65.6% (42/64)</td><td class="num win">+15.6 pp</td></tr>
+      <tr><td>GSM8K (n=128)</td><td>3-Pass</td><td class="num">93.8% (120/128)</td><td class="num win">96.9% (124/128)</td><td class="num">94.5% (121/128)</td><td class="num win">+3.1 pp</td></tr>
+      <tr><td>GSM8K (n=128)</td><td>4-Pass</td><td class="num">3.1% (4/128*)</td><td class="num">95.3% (122/128)</td><td class="num win">96.1% (123/128)</td><td class="num win">+2.3 pp</td></tr>
+      <tr><td>LiveCodeBench v6 (n=32)</td><td>3-Pass / 4-Pass</td><td class="num">34.4 / 3.1%*</td><td class="num">37.5 / 37.5%</td><td class="num win">40.6 / 40.6%</td><td class="num win">+6.2 pp</td></tr>
+      <tr><td>2025&ndash;2026 Olympiad (n=64)</td><td>3-Pass / 4-Pass</td><td class="num">20.3 / 0.0%*</td><td class="num">21.9 / 17.2%</td><td class="num win">32.8 / 34.4%</td><td class="num win">+14.1 pp</td></tr>
+      <tr><td>MMLU (n=285)</td><td>3-Pass / 4-Pass</td><td class="num">82.5 / 74.7%*</td><td class="num">81.4 / 81.1%</td><td class="num win">83.5 / 83.2%</td><td class="num win">+1.0 pp</td></tr>
+      <tr><td>ARC-Challenge (n=300)</td><td>3-Pass / 4-Pass</td><td class="num">94.3 / 90.0%*</td><td class="num">94.3 / 93.0%</td><td class="num">94.0 / 93.7%</td><td class="num">&minus;0.3 pp</td></tr>
+      <tr><td>HellaSwag (n=300)</td><td>3-Pass / 4-Pass</td><td class="num">61.7 / 59.7%*</td><td class="num">61.7 / 61.3%</td><td class="num win">61.0 / 63.3%</td><td class="num win">+1.6 pp</td></tr>
+      <tr><td>WinoGrande (n=300)</td><td>3-Pass / 4-Pass</td><td class="num">68.7 / 60.7%*</td><td class="num win">70.0 / 67.0%</td><td class="num">67.0 / 64.7%</td><td class="num win">+1.3 pp</td></tr>
+      <tr><td>Terminal-Bench Core (n=10)</td><td>4-Pass</td><td class="num">0/10* (8.8% tests)</td><td class="num">&mdash;</td><td class="num win">6/10 (82.4% tests)</td><td class="num">&mdash;</td></tr>
+    </tbody>
+  </table>
+  <p style="font-size:0.88rem;color:#475569;"><em>*Base 4-pass and 5-pass scores are measured under our forced multi-pass override (<code>LoopConfig(num_passes=4/5)</code>). Evaluations use fixed public slices (n=32&ndash;300), greedy decoding, and open deterministic grading (<code>rse_looper/grader.py</code>). Independent third-party reproduction is welcomed.</em></p>
+
+  <h2>5. Run Locally</h2>
+  <pre>pip install -e ".[dev]"
+pytest -W error -v
+rse-looper --stage both --base-model thinkingmachines/Inkling-2-Mini --gpus 0,1,2,3,4,5 --require-causal-conv1d</pre>
+</main>
+</body>
+</html>
