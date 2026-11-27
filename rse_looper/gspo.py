@@ -19,6 +19,14 @@ import torch
 import torch.nn.functional as F
 
 
+def _solved_rollout(record: Mapping[str, Any]) -> bool:
+    return bool(record.get("correct") and record.get("completed") and not record.get("repetition"))
+
+
+def _is_frontier(records: Sequence[Mapping[str, Any]], solved: int) -> bool:
+    return 0 < solved < len(records)
+
+
 def compute_loop_advantage_gspo_groups(
     rollouts_by_id: Mapping[str, Sequence[Mapping[str, Any]]],
     delta_r_bonus: float = 0.35,
@@ -38,22 +46,22 @@ def compute_loop_advantage_gspo_groups(
         if not recs:
             continue
         total_rollouts += len(recs)
-        n_ok = sum(1 for r in recs if r.get("correct") and r.get("completed") and not r.get("repetition"))
+        n_ok = sum(_solved_rollout(r) for r in recs)
         total_correct += n_ok
         if n_ok > 0:
             n_any_solved += 1
         if n_ok == len(recs):
             n_all_solved += 1
-        if n_ok == 0 or n_ok == len(recs):
+        if not _is_frontier(recs, n_ok):
             continue
 
         r3_recs = [r for r in recs if r.get("regime") == "R3"]
-        r3_solved = any(r.get("correct") and r.get("completed") and not r.get("repetition") for r in r3_recs)
+        r3_solved = any(_solved_rollout(r) for r in r3_recs)
 
         rewards: List[float] = []
         group_had_rescue = False
         for r in recs:
-            is_win = bool(r.get("correct") and r.get("completed") and not r.get("repetition"))
+            is_win = _solved_rollout(r)
             rew = 1.0 if is_win else 0.0
             if r.get("repetition"):
                 rew -= float(rep_penalty)
@@ -78,6 +86,7 @@ def compute_loop_advantage_gspo_groups(
                 "reward": round(rew, 4),
                 "advantage": round(rew - mean_r, 4),
                 "old_avg_logprob": float(r["old_avg_logprob"]),
+                **{key: r[key] for key in ("input_ids", "prompt_len") if key in r},
                 "correct": bool(r.get("correct")),
                 "completed": bool(r.get("completed")),
                 "gen_tokens": int(r.get("gen_tokens", 0)),
@@ -175,6 +184,63 @@ def _format_math_prompt(tok: Any, problem: str, effort: str = "high") -> str:
         return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
+def _training_sequence(prompt_ids: list[int], completion_ids: list[int]) -> tuple[list[int], int]:
+    """Keep the generated token IDs and reserve room to score at least one completion token."""
+    max_length = 1280
+    prompt_ids = prompt_ids[-(max_length - 1):]
+    completion_ids = completion_ids[:max_length - len(prompt_ids)]
+    return prompt_ids + completion_ids, len(prompt_ids)
+
+
+@torch.no_grad()
+def _score_frontier_rollouts(
+    model: torch.nn.Module,
+    records: list[dict],
+    regimes: Sequence[tuple[str, Any, int]],
+    pad_token_id: int,
+    device: torch.device | str,
+    configure_forward,
+    batch_size: int = 2,
+) -> None:
+    """Score mixed-outcome groups only, keeping every answer in each selected group."""
+    by_problem: dict[str, list[dict]] = {}
+    for record in records:
+        by_problem.setdefault(record["id"], []).append(record)
+    frontier = [
+        record
+        for group in by_problem.values()
+        if _is_frontier(group, sum(_solved_rollout(record) for record in group))
+        for record in group
+    ]
+
+    for regime, config, _ in regimes:
+        candidates = sorted(
+            (record for record in frontier if record["regime"] == regime),
+            key=lambda record: len(record["input_ids"]),
+        )
+        if not candidates:
+            continue
+        configure_forward(model, config)
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start : start + batch_size]
+            sequences = [torch.tensor(record["input_ids"], dtype=torch.long) for record in batch]
+            lengths = torch.tensor([len(ids) for ids in sequences], device=device)
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                sequences, batch_first=True, padding_value=pad_token_id
+            ).to(device)
+            attention_mask = torch.arange(input_ids.shape[1], device=device) < lengths[:, None]
+            logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+            scores = torch.stack([
+                avg_sequence_logprob(
+                    logits[i : i + 1, :len(ids)], input_ids[i : i + 1, :len(ids)], record["prompt_len"]
+                )
+                for i, (record, ids) in enumerate(zip(batch, sequences))
+            ]).tolist()
+            for record, score in zip(batch, scores):
+                record["old_avg_logprob"] = score
+            del logits
+
+
 def _search_worker(local_idx: int, gpu_ids: List[int], model_path: str, rows: List[dict], out_dir: str, gen_idx: int, max_new_tokens: int) -> None:
     import json
     from transformers import AutoTokenizer, Inkling2LoopForCausalLM
@@ -195,7 +261,9 @@ def _search_worker(local_idx: int, gpu_ids: List[int], model_path: str, rows: Li
         model_path, dtype=torch.bfloat16, device_map={"": device}, experts_implementation="grouped_mm"
     ).eval()
 
-    my_rows = [r for i, r in enumerate(rows) if i % len(gpu_ids) == local_idx]
+    # All samples for a problem must be scored by the same worker, even if its ID appears twice.
+    owner_by_id = {row["id"]: i % len(gpu_ids) for i, row in enumerate(rows)}
+    my_rows = [row for row in rows if owner_by_id[row["id"]] == local_idx]
     reg_specs = [
         ("R3", LoopConfig(num_passes=3, rk_K=1), 2),
         ("R4", LoopConfig(num_passes=4, rk_K=1), 2),
@@ -216,25 +284,25 @@ def _search_worker(local_idx: int, gpu_ids: List[int], model_path: str, rows: Li
                     **inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.72, top_p=0.95,
                     pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id,
                 )
+            generated_ids = gen_out[:, in_len:].tolist()
+            prompt_ids = inputs["input_ids"].tolist()
+            prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
             for j, (r, s_idx) in enumerate(chunk):
-                g_ids = gen_out[j, in_len:]
-                ep = (g_ids == tok.eos_token_id).nonzero(as_tuple=True)[0]
-                if len(ep) > 0:
-                    g_ids = g_ids[: ep[0].item() + 1]
-                raw = tok.decode(g_ids, skip_special_tokens=False)
+                completion_ids = generated_ids[j]
+                if tok.eos_token_id in completion_ids:
+                    completion_ids = completion_ids[:completion_ids.index(tok.eos_token_id) + 1]
+                raw = tok.decode(completion_ids, skip_special_tokens=False)
                 g = grade_math_output(raw, r["answer"])
-                pr = _format_math_prompt(tok, r["problem"])
-                p_len = len(tok(pr)["input_ids"])
-                full_ids = tok(pr + raw, return_tensors="pt", truncation=True, max_length=1280)["input_ids"].to(device)
-                with torch.no_grad():
-                    logits = model(input_ids=full_ids, use_cache=False).logits
-                    old_lp = float(avg_sequence_logprob(logits, full_ids, min(p_len, full_ids.shape[1] - 4)).item())
+                unpadded_prompt = prompt_ids[j][in_len - prompt_lengths[j]:]
+                ids, prompt_len = _training_sequence(unpadded_prompt, completion_ids)
                 records.append({
                     "id": r["id"], "problem": r["problem"], "answer": r["answer"], "regime": reg_name,
-                    "sample_idx": s_idx, "gen_tokens": int(len(g_ids)), "correct": bool(g["correct"]),
+                    "sample_idx": s_idx, "gen_tokens": len(completion_ids), "correct": bool(g["correct"]),
                     "completed": bool(g["completed"]), "repetition": bool(g["repetition"]),
-                    "old_avg_logprob": old_lp, "raw_full": raw,
+                    "input_ids": ids, "prompt_len": prompt_len, "raw_full": raw,
                 })
+
+    _score_frontier_rollouts(model, records, reg_specs, tok.pad_token_id, device, install_midstack_loop_forward)
     with open(os.path.join(out_dir, f"search.shard{local_idx}.jsonl"), "w") as f:
         for rec in records:
             f.write(json.dumps(rec) + "\n")
@@ -246,7 +314,7 @@ def _ddp_update_worker(
 ) -> None:
     import json
     import torch.distributed as dist
-    from transformers import AutoTokenizer, Inkling2LoopForCausalLM
+    from transformers import Inkling2LoopForCausalLM
     from rse_looper.checkpoint import is_editable_param
     from rse_looper.looping import LoopConfig, install_midstack_loop_forward
     from rse_looper.preflight import enable_fast_math
@@ -259,7 +327,6 @@ def _ddp_update_worker(
     enable_fast_math()
     device = f"cuda:{gid}"
 
-    tok = AutoTokenizer.from_pretrained(model_path)
     model = Inkling2LoopForCausalLM.from_pretrained(
         model_path, dtype=torch.bfloat16, device_map={"": device}, experts_implementation="grouped_mm"
     )
@@ -275,10 +342,8 @@ def _ddp_update_worker(
     rows = [json.loads(l) for l in open(gspo_path) if l.strip()]
     prepped = []
     for r in rows:
-        pr = _format_math_prompt(tok, r["problem"])
-        p_len = len(tok(pr)["input_ids"])
-        ids = tok(pr + r["raw_full"], return_tensors="pt", truncation=True, max_length=1280)["input_ids"]
-        prepped.append((ids, min(p_len, ids.shape[1] - 4), r["regime"], float(r["advantage"]), float(r["old_avg_logprob"])))
+        ids = torch.tensor([r["input_ids"]], dtype=torch.long)
+        prepped.append((ids, r["prompt_len"], r["regime"], float(r["advantage"]), float(r["old_avg_logprob"])))
 
     my_idxs = [i for i in range(len(prepped)) if i % world_size == local_rank] or [0]
     opt = torch.optim.AdamW([p for _, p in trainable], lr=lr, weight_decay=0.01, betas=(0.9, 0.95))
@@ -461,6 +526,11 @@ def main(argv=None) -> dict:
             for grp in groups:
                 for it in grp["items"]:
                     f.write(json.dumps(it) + "\n")
+        if not groups:
+            consec_reject += 1
+            if consec_reject >= args.patience:
+                break
+            continue
         delta_path = os.path.join(gdir, f"gspo_gen{g}_delta.pt")
         mp.spawn(_ddp_update_worker, args=(len(gpu_ids), gpu_ids, cur_model, gspo_path, delta_path, args.steps_per_gen, args.lr * (0.9 ** accepted), 3000 + g), nprocs=len(gpu_ids), join=True)
 

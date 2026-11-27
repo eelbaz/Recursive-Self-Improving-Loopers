@@ -1,11 +1,15 @@
 """Unit tests for rse_looper.gspo (Loop-Advantage GSPO, DAPO Clip-Higher, Dr. GRPO, 3-regime gate)."""
 
 import math
+from types import SimpleNamespace
 import pytest
 import torch
 
 from rse_looper.gspo import (
+    _score_frontier_rollouts,
+    _training_sequence,
     accept_3regime_rsi_step,
+    avg_sequence_logprob,
     clip_generation_deltas,
     compute_loop_advantage_gspo_groups,
     gspo_dapo_sequence_loss,
@@ -99,3 +103,66 @@ def test_clip_generation_deltas_caps_norm_and_rejects_nan():
     bad = torch.zeros(10, 10); bad[0, 0] = float("nan")
     with pytest.raises(ValueError):
         clip_generation_deltas({"w": bad}, base)
+
+
+def test_frontier_scoring_batches_only_mixed_groups_and_preserves_token_ids():
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def forward(self, input_ids, attention_mask=None, use_cache=False):
+            if attention_mask is not None:
+                self.batches.append((input_ids.tolist(), attention_mask.tolist()))
+            logits = torch.nn.functional.one_hot(input_ids, num_classes=8).float()
+            return SimpleNamespace(logits=logits)
+
+    def rollout(problem_id, correct, input_ids, regime="R3"):
+        return {
+            "id": problem_id,
+            "problem": problem_id,
+            "raw_full": "decoded text",
+            "regime": regime,
+            "correct": correct,
+            "completed": True,
+            "input_ids": input_ids,
+            "prompt_len": 2,
+        }
+
+    mixed = [
+        rollout("mixed", True, [1, 2, 2]),
+        rollout("mixed", False, [1, 2, 3, 4, 4]),
+        rollout("mixed", False, [1, 2, 3], "R4"),
+    ]
+    discarded = [
+        rollout("all solved", True, [1, 2, 3]),
+        rollout("all failed", False, [1, 2, 3]),
+    ]
+    model = ToyModel()
+    configs = []
+    regimes = [("R3", "three passes", 2), ("R4", "four passes", 2)]
+    _score_frontier_rollouts(
+        model, mixed + discarded, regimes, 0, "cpu", lambda _, config: configs.append(config)
+    )
+
+    assert configs == ["three passes", "four passes"]
+    assert model.batches == [
+        ([[1, 2, 2, 0, 0], [1, 2, 3, 4, 4]], [[True, True, True, False, False], [True] * 5]),
+        ([[1, 2, 3]], [[True] * 3]),
+    ]
+    assert all("old_avg_logprob" not in record for record in discarded)
+    groups, _ = compute_loop_advantage_gspo_groups({"mixed": mixed})
+    for original, scored in zip(mixed, groups[0]["items"]):
+        assert scored["input_ids"] == original["input_ids"]
+        assert scored["prompt_len"] == original["prompt_len"]
+        ids = torch.tensor([scored["input_ids"]])
+        expected = avg_sequence_logprob(model(ids).logits, ids, scored["prompt_len"])
+        assert scored["old_avg_logprob"] == pytest.approx(expected.item())
+
+
+def test_training_sequence_reserves_room_for_completion_tokens():
+    assert _training_sequence([1, 2], [3, 4]) == ([1, 2, 3, 4], 2)
+    prompt = list(range(1280))
+    ids, prompt_len = _training_sequence(prompt, [2000, 2001])
+    assert ids == prompt[1:] + [2000]
+    assert prompt_len == 1279
